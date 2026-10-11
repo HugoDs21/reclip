@@ -1,0 +1,63 @@
+name: Sync upstream and publish image
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-and-publish
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        id: sync
+        run: |
+          before=$(git rev-parse HEAD)
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git remote add upstream https://github.com/averygan/reclip.git
+          git fetch upstream main
+          git merge --no-edit upstream/main
+          git push origin main
+          [ "$before" != "$(git rev-parse HEAD)" ] && changed=true || changed=false
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        if: github.event_name != 'schedule' || steps.sync.outputs.changed == 'true'
+        run: docker build -t ghcr.io/hugods21/reclip:latest .
+
+      - name: Smoke test image
+        if: github.event_name != 'schedule' || steps.sync.outputs.changed == 'true'
+        run: |
+          container=$(docker run -d -e RECLIP_NO_UPDATE=1 -p 127.0.0.1:8899:8899 ghcr.io/hugods21/reclip:latest)
+          trap 'docker rm -f "$container"' EXIT
+          if ! curl --fail --retry 30 --retry-delay 2 --retry-all-errors http://127.0.0.1:8899/ >/dev/null; then
+            docker logs "$container"
+            exit 1
+          fi
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'schedule' || steps.sync.outputs.changed == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish image
+        if: github.event_name != 'schedule' || steps.sync.outputs.changed == 'true'
+        run: docker push ghcr.io/hugods21/reclip:latest
